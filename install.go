@@ -43,23 +43,6 @@ func checkOpenClawCLI() (bool, string) {
 	return true, string(output)
 }
 
-// findNPM 返回 npm 的完整路径，依次尝试 PATH 和常见安装位置
-func findNPM() string {
-	if p, err := exec.LookPath("npm"); err == nil {
-		return p
-	}
-	for _, dir := range []string{
-		os.ExpandEnv("$ProgramFiles\\nodejs\\npm.cmd"),
-		os.ExpandEnv("$ProgramFiles(x86)\\nodejs\\npm.cmd"),
-		os.ExpandEnv("$LOCALAPPDATA\\Programs\\nodejs\\npm.cmd"),
-	} {
-		if _, err := os.Stat(dir); err == nil {
-			return dir
-		}
-	}
-	return ""
-}
-
 func configFileExists() bool {
 	_, err := os.Stat(getOpenClawConfigPath())
 	return err == nil
@@ -298,12 +281,9 @@ func autoInstallNodeJS(logChan chan string, onProgress func(string)) (msiPath st
 
 // verifyNodeJSInstall 验证 Node.js 是否真正安装成功（检查实际文件，不依赖 PATH）
 func verifyNodeJSInstall() (bool, string) {
-	// 先通过 PATH 检测
 	if ok, ver := checkNodeJS(); ok {
 		return true, ver
 	}
-
-	// PATH 没刷出来，检查常见安装位置
 	locations := []string{
 		os.ExpandEnv("$ProgramFiles\\nodejs\\node.exe"),
 		os.ExpandEnv("$ProgramFiles(x86)\\nodejs\\node.exe"),
@@ -317,14 +297,49 @@ func verifyNodeJSInstall() (bool, string) {
 	return false, ""
 }
 
-// restartApp 重启应用程序
+// ensureNodePath 将 Node.js + npm 目录注入当前进程 PATH
+// 返回 true 表示 PATH 已可用（原本就有或注入成功）
+func ensureNodePath() bool {
+	if ok, _ := checkNodeJS(); ok {
+		return true
+	}
+
+	nodeDirs := []string{
+		os.ExpandEnv("$ProgramFiles\\nodejs"),
+		os.ExpandEnv("$ProgramFiles(x86)\\nodejs"),
+		os.ExpandEnv("$LOCALAPPDATA\\Programs\\nodejs"),
+	}
+	var foundDir string
+	for _, dir := range nodeDirs {
+		if _, err := os.Stat(filepath.Join(dir, "node.exe")); err == nil {
+			foundDir = dir
+			break
+		}
+	}
+	if foundDir == "" {
+		return false
+	}
+
+	currentPath := os.Getenv("PATH")
+	// node 目录
+	newPath := foundDir + string(os.PathListSeparator) + currentPath
+	// npm 全局 bin（不检查存在性，npm install -g 之后才会出现）
+	npmBin := os.ExpandEnv("$APPDATA\\npm")
+	newPath = npmBin + string(os.PathListSeparator) + newPath
+
+	os.Setenv("PATH", newPath)
+	return true
+}
+
+// restartApp 重启应用程序（通过 cmd /c start 启动以获取最新 PATH）
 func restartApp() {
 	exe, err := os.Executable()
 	if err != nil {
 		return
 	}
-	cmd := exec.Command(exe)
-	cmd.Start()
+	// exec.Command 直接启动子进程会继承父进程的旧环境变量
+	// 必须通过 cmd /c start 走 ShellExecuteEx，才能从注册表读取最新 PATH
+	exec.Command("cmd", "/c", "start", "", exe).Start()
 	os.Exit(0)
 }
 
@@ -539,27 +554,24 @@ func InstallWizard(w fyne.Window, logChan chan string) fyne.CanvasObject {
 
 			// 后续步骤（OpenClaw CLI + setup），作为闭包可在多处调用
 			continueAfterNode := func() {
+				// Node.js 不在 PATH → 从磁盘找到目录注入环境变量
+				if !ensureNodePath() {
+					safelog(logChan, "[Setup] 无法找到 Node.js 目录")
+					fyne.Do(func() {
+						statusCLI.SetText("[X] 未找到 Node.js")
+						prepProgress.SetText("环境准备失败")
+						prepBtn.Enable()
+					})
+					return
+				}
+
 				// OpenClaw CLI
 				fyne.Do(func() { statusCLI.SetText("正在检查 OpenClaw CLI...") })
 				ok, ver := checkOpenClawCLI()
 				if !ok {
-					// openclaw 不在 PATH，尝试用完整路径安装
-					npmPath := findNPM()
-					if npmPath == "" {
-						// npm 也找不到 → 新安装的 Node.js PATH 未刷新，重启
-						safelog(logChan, "[Setup] npm 不在 PATH，Node.js 刚安装需重启加载环境变量")
-						fyne.Do(func() {
-							statusCLI.SetText("[!] Node.js 环境变量未生效，正在重启应用...")
-							prepProgress.SetText("正在重启...")
-						})
-						time.Sleep(1500 * time.Millisecond)
-						restartApp()
-						return
-					}
-
-					fyne.Do(func() { statusCLI.SetText("[X] 未检测到 openclaw，正在安装（" + npmPath + "）...") })
-					safelog(logChan, "[Setup] openclaw CLI 未安装，执行 "+npmPath+" install -g openclaw")
-					cmd := exec.Command(npmPath, "install", "-g", "openclaw")
+					fyne.Do(func() { statusCLI.SetText("[X] 未检测到 openclaw，正在安装...") })
+					safelog(logChan, "[Setup] openclaw CLI 未安装，执行 npm install -g openclaw")
+					cmd := exec.Command("npm", "install", "-g", "openclaw")
 					output, err := cmd.CombinedOutput()
 					if err != nil {
 						errMsg := cmdError("npm install openclaw", err, output)
@@ -574,17 +586,11 @@ func InstallWizard(w fyne.Window, logChan chan string) fyne.CanvasObject {
 					}
 					ok, ver = checkOpenClawCLI()
 					if !ok {
-						// 装好了但不在 PATH → 重启加载环境变量
-						safelog(logChan, "[Setup] openclaw 已安装但需重启加载 PATH")
-						fyne.Do(func() {
-							statusCLI.SetText("[!] OpenClaw 已安装但需重启加载 PATH")
-							prepProgress.SetText("正在重启...")
-						})
-						time.Sleep(1500 * time.Millisecond)
-						restartApp()
-						return
+						safelog(logChan, "[Setup] openclaw 已安装")
+						fyne.Do(func() { statusCLI.SetText("[OK] OpenClaw CLI 已安装") })
+					} else {
+						fyne.Do(func() { statusCLI.SetText("[OK] OpenClaw CLI: " + ver) })
 					}
-					fyne.Do(func() { statusCLI.SetText("[OK] OpenClaw CLI: " + ver) })
 				} else {
 					fyne.Do(func() { statusCLI.SetText("[OK] OpenClaw CLI: " + ver) })
 				}
@@ -696,6 +702,8 @@ func InstallWizard(w fyne.Window, logChan chan string) fyne.CanvasObject {
 								installed, loc := verifyNodeJSInstall()
 								if installed {
 									fyne.Do(func() { statusNode.SetText("[OK] Node.js 已安装: " + loc) })
+									// 注入 PATH 到当前进程，避免重启
+									ensureNodePath()
 									go continueAfterNode()
 								} else {
 									safelog(logChan, "[Setup] 用户确认安装但验证失败")
