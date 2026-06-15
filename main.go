@@ -232,7 +232,9 @@ func main() {
 	if cfg.TargetStatus {
 		statusLabel.SetText("当前状态: 启动中...")
 		supervisor.Start()
+		status = true
 		statusLabel.SetText("当前状态: 已启动")
+		refreshGatewayLink()
 	}
 
 	// 开机自启时直接隐藏窗口，不闪出
