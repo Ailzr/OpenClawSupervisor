@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 )
 
 func main() {
@@ -200,6 +201,10 @@ func main() {
 		statusLabel.SetText("当前状态: 启动中...")
 		supervisor.Start()
 		statusLabel.SetText("当前状态: 已启动")
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			fyne.Do(w.Hide)
+		}()
 	}
 
 	w.ShowAndRun()

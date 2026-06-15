@@ -62,8 +62,10 @@ func (s *Supervisor) Stop() {
 		// 如果通道堵塞或没人读（比如软件正在退出），直接忽略日志，防止死锁
 	}
 
-	stopCmd := createSilentCmd("gateway", "stop")
-	_ = stopCmd.Run()
+	go func() {
+		stopCmd := createSilentCmd("gateway", "stop")
+		_ = stopCmd.Run()
+	}()
 }
 
 func (s *Supervisor) StopAutoStart() {
@@ -74,54 +76,62 @@ func (s *Supervisor) StopAutoStart() {
 }
 
 func (s *Supervisor) superviseLoop() {
-	ticker := time.NewTicker(time.Duration(s.cfg.Interval) * time.Second)
+	// 初始化定时器，一进来先触发一次检测（通过设置一个已经过期的 ticker 或者手动先跑一次）
+	interval := time.Duration(s.cfg.Interval) * time.Second
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	s.logChan <- "[Supervisor] 激活保活守护线程..."
+
+	// 定义一个核心检测并尝试拉起的函数
+	checkAndRun := func() {
+		address := fmt.Sprintf("127.0.0.1:%d", s.cfg.Port)
+		conn, err := net.DialTimeout("tcp", address, 3*time.Second)
+		if err == nil {
+			conn.Close() // 存活，正常响应，直接返回
+			return
+		}
+
+		// 端口未响应，执行拉起
+		s.logChan <- fmt.Sprintf("[Supervisor] 检测到端口 %s 未响应，尝试拉起 OpenClaw...", address)
+		runCmd := createSilentCmd("gateway", "run")
+
+		stdout, err := runCmd.StdoutPipe()
+		if err == nil {
+			stderr, _ := runCmd.StderrPipe()
+			go s.pipeLog(stdout)
+			go s.pipeLog(stderr)
+		}
+
+		if err := runCmd.Start(); err != nil {
+			s.logChan <- fmt.Sprintf("[Error] 拉起失败: %v", err)
+		} else {
+			s.logChan <- "[Supervisor] OpenClaw 进程已在后台隐式建立"
+			s.currentCmd = runCmd
+
+			s.logChan <- "[Supervisor] 进入启动保护期，等待 Node.js 异步服务挂载..."
+
+			// 【关键点】直接利用 select 阻塞 6 秒，同时能响应上下文退出信号
+			// 这样在 6 秒保护期内，绝对不会进入下一个 ticker 循环，也就绝不会重复拉起
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-time.After(30 * time.Second):
+				s.logChan <- "[Supervisor] 启动保护期结束，恢复正常监控"
+			}
+		}
+	}
+
+	// 先执行一次首次检查
+	checkAndRun()
 
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
-		default:
-
-			address := fmt.Sprintf("127.0.0.1:%d", s.cfg.Port)
-
-			// 增加拨号超时到 3 秒，防止 Node.js 后台太忙响应慢
-			conn, err := net.DialTimeout("tcp", address, 3*time.Second)
-
-			if err != nil {
-				s.logChan <- fmt.Sprintf("[Supervisor] 检测到端口 %s 未响应，尝试拉起 OpenClaw...", address)
-				runCmd := createSilentCmd("gateway", "run")
-
-				stdout, err := runCmd.StdoutPipe()
-				if err == nil {
-					stderr, _ := runCmd.StderrPipe()
-					go s.pipeLog(stdout)
-					go s.pipeLog(stderr)
-				}
-
-				if err := runCmd.Start(); err != nil {
-					s.logChan <- fmt.Sprintf("[Error] 拉起失败: %v", err)
-				} else {
-					s.logChan <- "[Supervisor] OpenClaw 进程已在后台隐式建立"
-					s.currentCmd = runCmd
-
-					// 【核心改动】给 OpenClaw 6 秒钟的优雅启动时间（Startup Grace Period）
-					// 在这 6 秒内，守护线程会静静等待它把 HTTP 服务完全跑起来，不重复拉起
-					s.logChan <- "[Supervisor] 进入启动保护期，等待 Node.js 异步服务挂载..."
-					time.Sleep(6 * time.Second)
-				}
-			} else {
-				conn.Close() // 存活，正常
-			}
-		}
-
-		select {
-		case <-s.ctx.Done():
-			return
 		case <-ticker.C:
-			ticker.Reset(time.Duration(s.cfg.Interval) * time.Second)
+			// 每次定时器到了，才执行一次检查
+			checkAndRun()
 		}
 	}
 }
