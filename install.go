@@ -57,27 +57,27 @@ func cmdError(label string, err error, output []byte) string {
 }
 
 func applyProviderConfig(providerID, baseURL, apiKey, defaultModel string) error {
+	providerCfg := map[string]interface{}{
+		"api":        "openai-completions",
+		"auth":       "api-key",
+		"authHeader": false,
+		"baseUrl":    baseURL,
+		"apiKey":     apiKey,
+	}
+
+	// 写入默认模型到 provider 的 models 列表
+	if defaultModel != "" {
+		providerCfg["models"] = []map[string]interface{}{
+			{"id": defaultModel, "name": defaultModel},
+		}
+	}
+
 	patch := map[string]interface{}{
 		"models": map[string]interface{}{
 			"providers": map[string]interface{}{
-				providerID: map[string]interface{}{
-					"api":        "openai-completions",
-					"auth":       "api-key",
-					"authHeader": false,
-					"baseUrl":    baseURL,
-					"apiKey":     apiKey,
-				},
+				providerID: providerCfg,
 			},
 		},
-	}
-
-	// 如果填了默认模型，一并写入 agents.defaults.model
-	if defaultModel != "" {
-		patch["agents"] = map[string]interface{}{
-			"defaults": map[string]interface{}{
-				"model": defaultModel,
-			},
-		}
 	}
 
 	patchJSON, err := json.Marshal(patch)
