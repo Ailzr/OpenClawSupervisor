@@ -5,9 +5,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -71,7 +73,7 @@ func cmdError(label string, err error, output []byte) string {
 	return fmt.Sprintf("%s: %v\n\n%s", label, err, outStr)
 }
 
-func applyProviderConfig(providerID, baseURL, apiKey string) error {
+func applyProviderConfig(providerID, baseURL, apiKey, defaultModel string) error {
 	patch := map[string]interface{}{
 		"models": map[string]interface{}{
 			"providers": map[string]interface{}{
@@ -84,6 +86,15 @@ func applyProviderConfig(providerID, baseURL, apiKey string) error {
 				},
 			},
 		},
+	}
+
+	// 如果填了默认模型，一并写入 agents.defaults.model
+	if defaultModel != "" {
+		patch["agents"] = map[string]interface{}{
+			"defaults": map[string]interface{}{
+				"model": defaultModel,
+			},
+		}
 	}
 
 	patchJSON, err := json.Marshal(patch)
@@ -352,19 +363,25 @@ func InstallWizard(w fyne.Window, logChan chan string) fyne.CanvasObject {
 	apiKeyEntry := widget.NewPasswordEntry()
 	apiKeyEntry.SetPlaceHolder("输入你的 API Key...")
 
+	modelEntry := widget.NewEntry()
+	modelEntry.SetPlaceHolder("例如: deepseek-v4-flash, gpt-4o...")
+
+	fetchModelsBtn := widget.NewButton("从 API 拉取模型列表", nil)
+	fetchModelsBtn.Importance = widget.LowImportance
+
 	// 常见供应商预设
 	type providerPreset struct {
-		name, id, baseURL string
+		name, id, baseURL, defaultModel string
 	}
 	presets := []providerPreset{
-		{"DeepSeek", "deepseek", "https://api.deepseek.com"},
-		{"OpenAI", "openai", "https://api.openai.com/v1"},
-		{"Anthropic", "anthropic", "https://api.anthropic.com/v1"},
-		{"阿里云百炼 (DashScope)", "dashscope", "https://dashscope.aliyuncs.com/compatible-mode/v1"},
-		{"火山引擎 (豆包/DeepSeek)", "ark", "https://ark.cn-beijing.volces.com/api/v3"},
-		{"硅基流动 (SiliconFlow)", "siliconflow", "https://api.siliconflow.cn/v1"},
-		{"智谱 (Zhipu/GLM)", "zhipu", "https://open.bigmodel.cn/api/paas/v4"},
-		{"Moonshot (Kimi)", "moonshot", "https://api.moonshot.cn/v1"},
+		{"DeepSeek", "deepseek", "https://api.deepseek.com", "deepseek-v4-flash"},
+		{"OpenAI", "openai", "https://api.openai.com/v1", "gpt-4o"},
+		{"Anthropic", "anthropic", "https://api.anthropic.com/v1", "claude-sonnet-4-20250514"},
+		{"阿里云百炼 (DashScope)", "dashscope", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-plus"},
+		{"火山引擎 (豆包/DeepSeek)", "ark", "https://ark.cn-beijing.volces.com/api/v3", "deepseek-v4-flash"},
+		{"硅基流动 (SiliconFlow)", "siliconflow", "https://api.siliconflow.cn/v1", "deepseek-ai/DeepSeek-V3"},
+		{"智谱 (Zhipu/GLM)", "zhipu", "https://open.bigmodel.cn/api/paas/v4", "glm-4-plus"},
+		{"Moonshot (Kimi)", "moonshot", "https://api.moonshot.cn/v1", "moonshot-v1-8k"},
 	}
 	presetNames := make([]string, len(presets))
 	for i, p := range presets {
@@ -375,11 +392,61 @@ func InstallWizard(w fyne.Window, logChan chan string) fyne.CanvasObject {
 			if p.name == selected {
 				providerIDEntry.SetText(p.id)
 				baseURLEntry.SetText(p.baseURL)
+				modelEntry.SetText(p.defaultModel)
 				break
 			}
 		}
 	})
-	providerSelect.PlaceHolder = "选择供应商（自动填入 ID 和地址，无需手动输入）..."
+	providerSelect.PlaceHolder = "选择供应商（自动填入 ID、地址和默认模型）..."
+
+	fetchModelsBtn.OnTapped = func() {
+		baseURL := baseURLEntry.Text
+		apiKey := apiKeyEntry.Text
+		if baseURL == "" || apiKey == "" {
+			dialog.ShowError(fmt.Errorf("请先填写 Base URL 和 API Key"), w)
+			return
+		}
+		go func() {
+			fetchModelsBtn.Disable()
+			defer fetchModelsBtn.Enable()
+
+			req, _ := http.NewRequest("GET", strings.TrimRight(baseURL, "/")+"/models", nil)
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				fyne.Do(func() { dialog.ShowError(fmt.Errorf("请求失败: %v", err), w) })
+				return
+			}
+			defer resp.Body.Close()
+
+			var result struct {
+				Data []struct {
+					ID string `json:"id"`
+				} `json:"data"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				fyne.Do(func() { dialog.ShowError(fmt.Errorf("解析模型列表失败: %v", err), w) })
+				return
+			}
+
+			modelIDs := make([]string, 0, len(result.Data))
+			for _, m := range result.Data {
+				modelIDs = append(modelIDs, m.ID)
+			}
+			if len(modelIDs) == 0 {
+				fyne.Do(func() { dialog.ShowInformation("模型列表", "未获取到任何模型，请检查 API Key 和 Base URL。", w) })
+				return
+			}
+
+			fyne.Do(func() {
+				dialog.ShowCustomConfirm("选择默认模型", "确定", "取消",
+					widget.NewSelect(modelIDs, func(selected string) {
+						modelEntry.SetText(selected)
+					}),
+					func(confirmed bool) {}, w)
+			})
+		}()
+	}
 
 	step2 := container.NewVBox(
 		widget.NewLabelWithStyle("配置模型提供商", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
@@ -391,6 +458,7 @@ func InstallWizard(w fyne.Window, logChan chan string) fyne.CanvasObject {
 			widget.NewFormItem("Provider ID", providerIDEntry),
 			widget.NewFormItem("Base URL", baseURLEntry),
 			widget.NewFormItem("API Key", apiKeyEntry),
+			widget.NewFormItem("Default Model", container.NewBorder(nil, nil, nil, fetchModelsBtn, modelEntry)),
 		),
 	)
 
@@ -628,7 +696,7 @@ func InstallWizard(w fyne.Window, logChan chan string) fyne.CanvasObject {
 								installed, loc := verifyNodeJSInstall()
 								if installed {
 									fyne.Do(func() { statusNode.SetText("[OK] Node.js 已安装: " + loc) })
-									continueAfterNode()
+									go continueAfterNode()
 								} else {
 									safelog(logChan, "[Setup] 用户确认安装但验证失败")
 									fyne.Do(func() {
@@ -653,6 +721,7 @@ func InstallWizard(w fyne.Window, logChan chan string) fyne.CanvasObject {
 		providerID := providerIDEntry.Text
 		baseURL := baseURLEntry.Text
 		apiKey := apiKeyEntry.Text
+		model := modelEntry.Text
 
 		if providerID == "" && baseURL == "" && apiKey == "" {
 			dialog.ShowInformation("安装完成",
@@ -685,7 +754,7 @@ func InstallWizard(w fyne.Window, logChan chan string) fyne.CanvasObject {
 					})
 				}
 			}()
-			if err := applyProviderConfig(providerID, baseURL, apiKey); err != nil {
+			if err := applyProviderConfig(providerID, baseURL, apiKey, model); err != nil {
 				errMsg := err.Error()
 				safelog(logChan, "[Setup] 配置写入失败: "+errMsg)
 				fyne.Do(func() {
