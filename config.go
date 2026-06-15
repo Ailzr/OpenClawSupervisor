@@ -33,10 +33,22 @@ func LoadConfig() AppConfig {
 }
 
 func SaveConfig(cfg AppConfig) {
-	data, _ := json.MarshalIndent(cfg, "", "  ")
-	os.WriteFile(getConfigFile(), data, 0644)
+	configPath := getConfigFile()
+	configDir := filepath.Dir(configPath)
 
-	// 处理注册表自启
+	// 确保目录存在（首次运行或从临时目录启动时目录可能不存在）
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		// 目录创建失败，尝试写入当前工作目录
+		configPath = filepath.Join(".", configFileName)
+	}
+
+	data, _ := json.MarshalIndent(cfg, "", "  ")
+	if err := os.WriteFile(configPath, data, 0644); err != nil {
+		// 最后的保险：写到一个确定能写的位置
+		os.WriteFile(configFileName, data, 0644)
+	}
+
+	// 处理注册表自启（失败不影响主流程）
 	execPath, _ := os.Executable()
 	k, _, err := registry.CreateKey(registry.CURRENT_USER, registryKeyPath, registry.SET_VALUE)
 	if err != nil {

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
@@ -8,10 +10,10 @@ import (
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/widget"
 	"log"
+	"net/url"
 	"os"
 	"strconv"
 	"sync"
-	"time"
 )
 
 func main() {
@@ -20,6 +22,7 @@ func main() {
 	w.Resize(fyne.NewSize(800, 600))
 
 	cfg := LoadConfig()
+	SaveConfig(cfg) // 确保配置文件存在，防止后续操作因文件缺失闪退
 	log.Println(cfg.AutoStart)
 	logChan := make(chan string, 100)
 	supervisor := NewSupervisor(&cfg, logChan)
@@ -41,7 +44,8 @@ func main() {
 		for text := range logChan {
 			// 【防御拦截 1】如果 context 已经被 cancel 了（说明程序正在退出），
 			// 立刻把残余日志倒进垃圾桶，绝对不再碰任何 UI 组件和数据绑定！
-			if supervisor.ctx.Err() != nil {
+			// 注意：supervisor.ctx 在 Start() 之前是 nil，需要判空
+			if supervisor.ctx != nil && supervisor.ctx.Err() != nil {
 				continue
 			}
 
@@ -57,7 +61,7 @@ func main() {
 			fyne.Do(func() {
 				// 【防御拦截 2】在 UI 线程内部二次确认。
 				// 如果滚动条组件已经或者正在被销毁，或者主窗口已经不可见，直接 return 闪人
-				if logScroll == nil || supervisor.ctx.Err() != nil {
+				if logScroll == nil || (supervisor.ctx != nil && supervisor.ctx.Err() != nil) {
 					return
 				}
 
@@ -69,8 +73,31 @@ func main() {
 
 	statusLabel := widget.NewLabel("当前状态: 未激活")
 	status := false
-	// 声明一个普通的互斥锁，不需要在 UI 线程里阻塞等待
 	var btnMux sync.Mutex
+
+	// 网关访问链接（从 openclaw 配置读取 token 和 port）
+	gatewayLinkLabel := widget.NewHyperlink("", nil)
+	gatewayLinkContainer := container.NewVBox(
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("网关访问链接", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		gatewayLinkLabel,
+	)
+	gatewayLinkContainer.Hidden = true
+
+	refreshGatewayLink := func() {
+		_, _, u := readGatewayAuth()
+		fyne.Do(func() {
+			if u != "" && status {
+				gatewayLinkLabel.Text = u
+				parsedURL, _ := url.Parse(u)
+				gatewayLinkLabel.URL = parsedURL
+				gatewayLinkContainer.Hidden = false
+			} else {
+				gatewayLinkContainer.Hidden = true
+			}
+		})
+	}
+	refreshGatewayLink()
 
 	statusBtn := widget.NewButton("启动/关闭 OpenClaw", func() {
 		// 1. 先用非阻塞的方式抢锁，防止用户疯狂连击按钮触发多线程撞车
@@ -95,6 +122,7 @@ func main() {
 				fyne.Do(func() {
 					statusLabel.SetText("当前状态: 已关闭")
 				})
+				refreshGatewayLink()
 			} else {
 				// 在后台默默激活保活和拉起命令
 				fyne.Do(func() {
@@ -106,6 +134,7 @@ func main() {
 				fyne.Do(func() {
 					statusLabel.SetText("当前状态: 已启动")
 				})
+				refreshGatewayLink()
 			}
 		}()
 	})
@@ -113,6 +142,7 @@ func main() {
 	controlTab := container.NewVBox(
 		container.NewHBox(statusBtn),
 		statusLabel,
+		gatewayLinkContainer,
 		widget.NewLabel("运行日志:"),
 		logScroll,
 	)
@@ -152,6 +182,8 @@ func main() {
 	tabs := container.NewAppTabs(
 		container.NewTabItem("监控面板", controlTab),
 		container.NewTabItem("系统设置", configTab),
+		container.NewTabItem("安装向导", InstallWizard(w, logChan)),
+		container.NewTabItem("更新管理", UpdatePanel(w, logChan)),
 	)
 	w.SetContent(tabs)
 
@@ -201,12 +233,44 @@ func main() {
 		statusLabel.SetText("当前状态: 启动中...")
 		supervisor.Start()
 		statusLabel.SetText("当前状态: 已启动")
-		go func() {
-			time.Sleep(300 * time.Millisecond)
-			fyne.Do(w.Hide)
-		}()
+	}
+
+	// 开机自启时直接隐藏窗口，不闪出
+	// 放在 ShowAndRun 之前同步调用，Fyne 创建原生窗口时会保持隐藏
+	if cfg.TargetStatus && cfg.AutoStart {
+		w.Hide()
+		safelog(logChan, "[System] 开机自启：窗口已隐藏至系统托盘")
 	}
 
 	w.ShowAndRun()
 
+}
+
+// readGatewayAuth 从 OpenClaw 配置文件读取网关认证 token 和访问链接
+func readGatewayAuth() (token string, port int, webURL string) {
+	configPath := getOpenClawConfigPath()
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+	var cfg struct {
+		Gateway struct {
+			Port int `json:"port"`
+			Auth struct {
+				Token string `json:"token"`
+			} `json:"auth"`
+		} `json:"gateway"`
+	}
+	if json.Unmarshal(data, &cfg) != nil {
+		return
+	}
+	port = cfg.Gateway.Port
+	if port == 0 {
+		port = 18789
+	}
+	token = cfg.Gateway.Auth.Token
+	if token != "" {
+		webURL = fmt.Sprintf("http://localhost:%d/?token=%s", port, token)
+	}
+	return
 }

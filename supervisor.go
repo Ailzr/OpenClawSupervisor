@@ -55,12 +55,8 @@ func (s *Supervisor) Stop() {
 	s.isLooping = false // 确保状态位同步重置
 	SaveConfig(*s.cfg)
 
-	// 【优化】先发日志（防止后面管道关闭发不进去），再执行耗时的同步停止命令
-	select {
-	case s.logChan <- "[Supervisor] 正在停止 OpenClaw...":
-	default:
-		// 如果通道堵塞或没人读（比如软件正在退出），直接忽略日志，防止死锁
-	}
+	// 先发日志再执行停止命令
+	safelog(s.logChan, "[Supervisor] 正在停止 OpenClaw...")
 
 	go func() {
 		stopCmd := createSilentCmd("gateway", "stop")
@@ -81,26 +77,24 @@ func (s *Supervisor) superviseLoop() {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	s.logChan <- "[Supervisor] 激活保活守护线程..."
+	safelog(s.logChan, "[Supervisor] 激活保活守护线程...")
 
 	// 定义一个核心检测并尝试拉起的函数
 	checkAndRun := func() {
 		address := fmt.Sprintf("127.0.0.1:%d", s.cfg.Port)
 		conn, err := net.DialTimeout("tcp", address, 3*time.Second)
 		if err == nil {
-			conn.Close() // 存活，正常响应，直接返回
+			conn.Close()
 			return
 		}
 
-		// 端口挂了，但先检查是否已有进程正在启动中
+		// 端口挂了，检查是否已有进程在启动中
 		if s.currentCmd != nil && s.currentCmd.Process != nil {
-			// 有进程在跑，别急着拉起新的，等它自己起来
-			s.logChan <- "[Supervisor] OpenClaw 进程仍在启动中，跳过本次拉起..."
+			safelog(s.logChan, "[Supervisor] OpenClaw 进程仍在启动中，跳过本次拉起...")
 			return
 		}
 
-		// 端口未响应，执行拉起
-		s.logChan <- fmt.Sprintf("[Supervisor] 检测到端口 %s 未响应，尝试拉起 OpenClaw...", address)
+		safelog(s.logChan, fmt.Sprintf("[Supervisor] 检测到端口 %s 未响应，尝试拉起 OpenClaw...", address))
 		runCmd := createSilentCmd("gateway", "run")
 
 		stdout, err := runCmd.StdoutPipe()
@@ -111,23 +105,21 @@ func (s *Supervisor) superviseLoop() {
 		}
 
 		if err := runCmd.Start(); err != nil {
-			s.logChan <- fmt.Sprintf("[Error] 拉起失败: %v", err)
+			safelog(s.logChan, fmt.Sprintf("[Error] 拉起失败: %v", err))
 			return
 		}
 
-		s.logChan <- "[Supervisor] OpenClaw 进程已在后台隐式建立"
+		safelog(s.logChan, "[Supervisor] OpenClaw 进程已在后台隐式建立")
 		s.currentCmd = runCmd
 
-		// 监听进程退出（runCmd.Wait() 会阻塞，扔到 goroutine 里）
 		processExited := make(chan struct{})
 		go func() {
 			_ = runCmd.Wait()
 			close(processExited)
 		}()
 
-		s.logChan <- "[Supervisor] 进入启动保护期，轮询等待服务挂载..."
+		safelog(s.logChan, "[Supervisor] 进入启动保护期，轮询等待服务挂载...")
 
-		// 轮询：端口通了 → 成功 / 进程挂了 → 失败 / 超时 → 兜底放行
 		maxWait := 120 * time.Second
 		pollInterval := 3 * time.Second
 		deadline := time.After(maxWait)
@@ -139,17 +131,17 @@ func (s *Supervisor) superviseLoop() {
 			case <-s.ctx.Done():
 				return
 			case <-processExited:
-				s.logChan <- "[Supervisor] OpenClaw 进程异常退出，启动失败"
+				safelog(s.logChan, "[Supervisor] OpenClaw 进程异常退出，启动失败")
 				s.currentCmd = nil
 				return
 			case <-deadline:
-				s.logChan <- "[Supervisor] 启动等待超时，进程可能仍在初始化，恢复正常监控"
+				safelog(s.logChan, "[Supervisor] 启动等待超时，进程可能仍在初始化，恢复正常监控")
 				return
 			case <-pollTicker.C:
 				conn, err := net.DialTimeout("tcp", address, 2*time.Second)
 				if err == nil {
 					conn.Close()
-					s.logChan <- "[Supervisor] OpenClaw 服务已成功挂载，恢复正常监控"
+					safelog(s.logChan, "[Supervisor] OpenClaw 服务已成功挂载，恢复正常监控")
 					return
 				}
 			}
@@ -173,6 +165,6 @@ func (s *Supervisor) superviseLoop() {
 func (s *Supervisor) pipeLog(reader io.ReadCloser) {
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
-		s.logChan <- scanner.Text()
+		safelog(s.logChan, scanner.Text())
 	}
 }
