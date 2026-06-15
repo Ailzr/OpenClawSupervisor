@@ -82,18 +82,18 @@ func main() {
 		widget.NewLabelWithStyle("网关访问链接", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		gatewayLinkLabel,
 	)
-	gatewayLinkContainer.Hidden = true
+	gatewayLinkContainer.Hide()
 
 	refreshGatewayLink := func() {
 		_, _, u := readGatewayAuth()
 		fyne.Do(func() {
 			if u != "" && status {
-				gatewayLinkLabel.Text = u
 				parsedURL, _ := url.Parse(u)
-				gatewayLinkLabel.URL = parsedURL
-				gatewayLinkContainer.Hidden = false
+				gatewayLinkLabel.SetText(u)
+				gatewayLinkLabel.SetURL(parsedURL)
+				gatewayLinkContainer.Show()
 			} else {
-				gatewayLinkContainer.Hidden = true
+				gatewayLinkContainer.Hide()
 			}
 		})
 	}
@@ -252,7 +252,9 @@ func main() {
 func readGatewayAuth() (token string, port int, webURL string) {
 	configPath := getOpenClawConfigPath()
 	data, err := os.ReadFile(configPath)
+	port = 18789
 	if err != nil {
+		webURL = fmt.Sprintf("http://localhost:%d/", port)
 		return
 	}
 	var cfg struct {
@@ -264,15 +266,17 @@ func readGatewayAuth() (token string, port int, webURL string) {
 		} `json:"gateway"`
 	}
 	if json.Unmarshal(data, &cfg) != nil {
+		webURL = fmt.Sprintf("http://localhost:%d/", port)
 		return
 	}
-	port = cfg.Gateway.Port
-	if port == 0 {
-		port = 18789
+	if cfg.Gateway.Port > 0 {
+		port = cfg.Gateway.Port
 	}
 	token = cfg.Gateway.Auth.Token
 	if token != "" {
 		webURL = fmt.Sprintf("http://localhost:%d/?token=%s", port, token)
+	} else {
+		webURL = fmt.Sprintf("http://localhost:%d/", port)
 	}
 	return
 }
