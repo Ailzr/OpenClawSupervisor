@@ -52,7 +52,8 @@ func (s *Supervisor) Stop() {
 		return
 	}
 	s.cancel()
-	s.isLooping = false // 确保状态位同步重置
+	s.isLooping = false
+	s.currentCmd = nil // 清除旧进程引用，否则下次启动会被误判为仍在启动中
 	SaveConfig(*s.cfg)
 
 	// 先发日志再执行停止命令
