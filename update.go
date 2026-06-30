@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 
 	"fyne.io/fyne/v2"
@@ -113,8 +114,18 @@ func UpdatePanel(w fyne.Window, logChan chan string) fyne.CanvasObject {
 					statusLabel.SetText("正在更新 OpenClaw...")
 
 					// --yes 跳过确认，--no-restart 不重启 gateway
+					// 设置 npm 镜像以加速国内下载（openclaw update 内部走 npm）
 					cmd := exec.Command("openclaw", "update", "--yes", "--no-restart")
+					cmd.Env = append(os.Environ(),
+						"npm_config_registry=https://registry.npmmirror.com")
 					output, err := cmd.CombinedOutput()
+
+					// 镜像失败则回退到默认源重试
+					if err != nil {
+						safelog(logChan, fmt.Sprintf("[Update] 镜像源失败: %v，回退到默认源重试...", err))
+						cmd2 := exec.Command("openclaw", "update", "--yes", "--no-restart")
+						output, err = cmd2.CombinedOutput()
+					}
 
 					fyne.Do(func() {
 						if err != nil {

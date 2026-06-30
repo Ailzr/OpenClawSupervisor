@@ -40,7 +40,6 @@ func (s *Supervisor) Start() {
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.isLooping = true
-	s.cfg.AutoStart = true
 	s.cfg.TargetStatus = true
 	SaveConfig(*s.cfg)
 
